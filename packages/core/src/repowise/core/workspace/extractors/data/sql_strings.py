@@ -21,6 +21,7 @@ Precision rules (this is where the false links would come from):
 
 from __future__ import annotations
 
+import bisect
 import logging
 import re
 from typing import TYPE_CHECKING
@@ -210,29 +211,39 @@ def _find_enclosing_block(content: str, opener_pos: int) -> str | None:
     return content[opener_pos:]
 
 
-def _is_jpql(content: str, start: int) -> bool:
+def _is_jpql(
+    content: str,
+    start: int,
+    named_positions: list[int] | None = None,
+    query_positions: list[int] | None = None,
+) -> bool:
     """True when string literal at *start* is a Java/Kotlin JPQL query."""
-    prefix = re.sub(r"(?:\s|//[^\n]*\n|/\*.*?\*/)+$", "", content[:start])
+    window = content[max(0, start - 200) : start]
+    prefix = re.sub(r"(?:\s|//[^\n]*\n|/\*.*?\*/)+$", "", window)
     if _CREATE_QUERY_RE.search(prefix):
         return True
 
-    last_named = None
-    for m in _JPQL_NAMED_QUERY_RE.finditer(content[:start]):
-        last_named = m
-    if (
-        last_named is not None
-        and last_named.group(1) == "NamedQuery"
-        and _is_enclosing_open(content, last_named.start(), start)
-    ):
-        return True
-
-    last_query = None
-    for m in _JPQL_QUERY_RE.finditer(content[:start]):
-        last_query = m
-    if last_query is not None and _is_enclosing_open(content, last_query.start(), start):
-        block = _find_enclosing_block(content, last_query.start())
-        if block is not None and not _JPQL_NATIVE_FLAG_RE.search(block):
+    if named_positions is None:
+        named_positions = [
+            m.start()
+            for m in _JPQL_NAMED_QUERY_RE.finditer(content[:start])
+            if m.group(1) == "NamedQuery"
+        ]
+    idx = bisect.bisect_right(named_positions, start) - 1
+    if idx >= 0:
+        pos = named_positions[idx]
+        if _is_enclosing_open(content, pos, start):
             return True
+
+    if query_positions is None:
+        query_positions = [m.start() for m in _JPQL_QUERY_RE.finditer(content[:start])]
+    idx = bisect.bisect_right(query_positions, start) - 1
+    if idx >= 0:
+        pos = query_positions[idx]
+        if _is_enclosing_open(content, pos, start):
+            block = _find_enclosing_block(content, pos)
+            if block is not None and not _JPQL_NATIVE_FLAG_RE.search(block):
+                return True
 
     return False
 
@@ -277,9 +288,16 @@ class SqlStringsDialect:
         """``(literal, line)`` for each SQL-looking string literal in *content*."""
         literals: list[tuple[str, int]] = []
         is_jvm = suffix in _JVM_EXTENSIONS
+        named_positions: list[int] | None = None
+        query_positions: list[int] | None = None
+        if is_jvm:
+            named_positions = [
+                m.start()
+                for m in _JPQL_NAMED_QUERY_RE.finditer(content)
+                if m.group(1) == "NamedQuery"
+            ]
+            query_positions = [m.start() for m in _JPQL_QUERY_RE.finditer(content)]
         for m in _STRING_RE.finditer(content):
-            if is_jvm and _is_jpql(content, m.start()):
-                continue
             s = next(g for g in m.groups() if g is not None)
             if (
                 len(s) >= _MIN_LITERAL_LEN
@@ -287,6 +305,8 @@ class SqlStringsDialect:
                 and _SQL_VERB_RE.search(s)
                 and (_UPPER_VERB_RE.search(s) or _SQL_PUNCT_RE.search(s))
             ):
+                if is_jvm and _is_jpql(content, m.start(), named_positions, query_positions):
+                    continue
                 literals.append((s, line_at(content, m.start())))
         return literals
 
