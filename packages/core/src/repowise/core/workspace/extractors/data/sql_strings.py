@@ -11,6 +11,12 @@ Precision rules (this is where the false links would come from):
 3. A table token that is itself interpolated (``FROM {table}`` /
    ``FROM ${table}`` / ``FROM " + name``) is skipped: normalization rejects
    non-identifier tokens, so an interpolated target emits nothing.
+4. In Java and Kotlin, JPQL queries (ORM entity-class queries in
+   ``@Query(...)`` without ``nativeQuery = true``, in ``@NamedQuery`` /
+   ``@NamedQueries``, and the first argument of ``createQuery(``) are skipped
+   so that entity names are not extracted as tables. Native queries (e.g.
+   ``@Query(..., nativeQuery = true)`` and ``createNativeQuery(``) continue
+   to emit their table targets.
 """
 
 from __future__ import annotations
@@ -119,6 +125,118 @@ def _verb_for_statement(stmt: object) -> str:
     return kind if kind in ("insert", "update", "delete", "merge") else "select"
 
 
+_JVM_EXTENSIONS = JAVA | KOTLIN
+
+_JPQL_QUERY_RE = re.compile(r"(?<![A-Za-z0-9_])(?:@|\.)?Query\b")
+_JPQL_NAMED_QUERY_RE = re.compile(r"@(NamedNativeQuery|NamedQuery)\b")
+_JPQL_NATIVE_FLAG_RE = re.compile(r"\bnativeQuery\s*=\s*true\b")
+_CREATE_QUERY_RE = re.compile(r"(?<![A-Za-z0-9_])createQuery\s*\($")
+
+
+def _is_enclosing_open(content: str, opener_pos: int, target_pos: int) -> bool:
+    """True when *target_pos* lies inside the parentheses opened at *opener_pos*."""
+    paren_idx = content.find("(", opener_pos, target_pos)
+    if paren_idx == -1:
+        return False
+    depth = 0
+    in_str = False
+    quote = ""
+    i = paren_idx
+    while i < target_pos:
+        ch = content[i]
+        if in_str:
+            if ch == "\\" and i + 1 < target_pos:
+                i += 2
+                continue
+            if content.startswith(quote, i):
+                in_str = False
+                i += len(quote)
+                continue
+        else:
+            if content.startswith(('"""', "'''"), i):
+                in_str = True
+                quote = content[i : i + 3]
+                i += 3
+                continue
+            if ch in ('"', "'", "`"):
+                in_str = True
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return False
+        i += 1
+    return depth > 0
+
+
+def _find_enclosing_block(content: str, opener_pos: int) -> str | None:
+    """The span from *opener_pos* to matching ``)``, or None if unparenthesized."""
+    paren_idx = content.find("(", opener_pos)
+    if paren_idx == -1:
+        return None
+    depth = 0
+    in_str = False
+    quote = ""
+    i = paren_idx
+    n = len(content)
+    while i < n:
+        ch = content[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if content.startswith(quote, i):
+                in_str = False
+                i += len(quote)
+                continue
+        else:
+            if content.startswith(('"""', "'''"), i):
+                in_str = True
+                quote = content[i : i + 3]
+                i += 3
+                continue
+            if ch in ('"', "'", "`"):
+                in_str = True
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return content[opener_pos : i + 1]
+        i += 1
+    return content[opener_pos:]
+
+
+def _is_jpql(content: str, start: int) -> bool:
+    """True when string literal at *start* is a Java/Kotlin JPQL query."""
+    prefix = re.sub(r"(?:\s|//[^\n]*\n|/\*.*?\*/)+$", "", content[:start])
+    if _CREATE_QUERY_RE.search(prefix):
+        return True
+
+    last_named = None
+    for m in _JPQL_NAMED_QUERY_RE.finditer(content[:start]):
+        last_named = m
+    if (
+        last_named is not None
+        and last_named.group(1) == "NamedQuery"
+        and _is_enclosing_open(content, last_named.start(), start)
+    ):
+        return True
+
+    last_query = None
+    for m in _JPQL_QUERY_RE.finditer(content[:start]):
+        last_query = m
+    if last_query is not None and _is_enclosing_open(content, last_query.start(), start):
+        block = _find_enclosing_block(content, last_query.start())
+        if block is not None and not _JPQL_NATIVE_FLAG_RE.search(block):
+            return True
+
+    return False
+
+
 class SqlStringsDialect:
     """Consumers from SQL literals in app code (all supported app languages)."""
 
@@ -134,7 +252,7 @@ class SqlStringsDialect:
     def extract(self, ctx: ScanContext) -> list[Contract]:
         out: list[Contract] = []
         seen: set[str] = set()
-        for literal, line in self._sql_literals(ctx.content):
+        for literal, line in self._sql_literals(ctx.content, ctx.suffix):
             for table_raw, verb in self._tables_in(literal):
                 if table_raw.lower().strip('"`[]') in _SQL_KEYWORDS:
                     continue
@@ -154,11 +272,14 @@ class SqlStringsDialect:
                     out.append(contract)
         return out
 
-    @staticmethod
-    def _sql_literals(content: str) -> list[tuple[str, int]]:
+    @classmethod
+    def _sql_literals(cls, content: str, suffix: str = "") -> list[tuple[str, int]]:
         """``(literal, line)`` for each SQL-looking string literal in *content*."""
         literals: list[tuple[str, int]] = []
+        is_jvm = suffix in _JVM_EXTENSIONS
         for m in _STRING_RE.finditer(content):
+            if is_jvm and _is_jpql(content, m.start()):
+                continue
             s = next(g for g in m.groups() if g is not None)
             if (
                 len(s) >= _MIN_LITERAL_LEN
@@ -202,9 +323,7 @@ class SqlStringsDialect:
             # reads. sqlglot models a reference to one as exp.Table all the
             # same, so ``WITH ranked AS (...) ... FROM ranked`` reported a
             # table named ``ranked``. Only unqualified references shadow.
-            cte_names = {
-                cte.alias.lower() for cte in stmt.find_all(exp.CTE) if cte.alias
-            }
+            cte_names = {cte.alias.lower() for cte in stmt.find_all(exp.CTE) if cte.alias}
             for table in stmt.find_all(exp.Table):
                 name = table.name
                 if not name:
